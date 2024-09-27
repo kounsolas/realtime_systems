@@ -15,6 +15,10 @@
 // Global variable to store WebSocket instance
 struct lws *wsi = NULL;  // Declare wsi globally
 
+// Forward declaration of reconnect_websocket function
+void reconnect_websocket();
+
+
 // Structures for candlestick and trade data
 typedef struct {
     double open;
@@ -97,7 +101,6 @@ int dequeue_trade(TradeQueue *queue, TradeData *trade) {
     pthread_mutex_unlock(&queue->lock);
     return 1;
 }
-
 
 // Function to write trade data to file
 void write_trade_to_file(const char* symbol, const TradeData* trade) {
@@ -239,40 +242,6 @@ void process_trades(const char* symbol, int i) {
     pthread_mutex_unlock(&c_list->lock);  // Unlock after processing
 }
 
-static int callback_example(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
-
-// Protocols array
-static struct lws_protocols protocols[] = {
-    { "lws-minimal-client", callback_example, 0, 0 },
-    { NULL, NULL, 0, 0 } // terminator
-};
-
-// WebSocket reconnection logic
-void reconnect_websocket() {
-    struct lws_client_connect_info i;
-    memset(&i, 0, sizeof(i));
-
-    i.context = lws_get_context(wsi);  // Use the global wsi
-    i.address = "ws.finnhub.io";
-    i.port = 443;
-    i.path = "/?token=" API_KEY;
-    i.host = i.address;
-    i.origin = i.address;
-    i.protocol = protocols[0].name;
-    i.ssl_connection = LCCSCF_USE_SSL;
-    i.pwsi = &wsi;
-
-    printf("Attempting to reconnect to WebSocket...\n");
-
-    if (lws_client_connect_via_info(&i)) {
-        printf("Reconnected to WebSocket!\n");
-    } else {
-        printf("Reconnection failed. Retrying in 5 seconds...\n");
-        sleep(5);
-        reconnect_websocket();
-    }
-}
-
 // Callback function for WebSocket events
 static int callback_example(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
     switch (reason) {
@@ -335,13 +304,13 @@ static int callback_example(struct lws *wsi, enum lws_callback_reasons reason, v
         case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
             printf(GREEN_TEXT"Client connection error: %s\n"RESET_TEXT, in ? (char *)in : "(null)");
             fflush(stdout);
-            reconnect_websocket();  // Reconnect on error
+            reconnect_websocket(1);  // Start with attempt 1
             break;
 
         case LWS_CALLBACK_CLIENT_CLOSED:
             printf(GREEN_TEXT"Client connection closed\n"RESET_TEXT);
             fflush(stdout);
-            reconnect_websocket();  // Reconnect when closed
+            reconnect_websocket(1);  // Start with attempt 1
             break;
 
         default:
@@ -350,7 +319,37 @@ static int callback_example(struct lws *wsi, enum lws_callback_reasons reason, v
     return 0;
 }
 
+// Protocols array
+static struct lws_protocols protocols[] = {
+    { "lws-minimal-client", callback_example, 0, 0 },
+    { NULL, NULL, 0, 0 } // terminator
+};
 
+// WebSocket reconnection logic with exponential backoff
+void reconnect_websocket(int attempt) {
+    struct lws_client_connect_info i;
+    memset(&i, 0, sizeof(i));
+
+    i.context = lws_get_context(wsi);  // Use the global wsi
+    i.address = "ws.finnhub.io";
+    i.port = 443;
+    i.path = "/?token=" API_KEY;
+    i.host = i.address;
+    i.origin = i.address;
+    i.protocol = protocols[0].name;
+    i.ssl_connection = LCCSCF_USE_SSL;
+    i.pwsi = &wsi;
+
+    printf("Attempting to reconnect to WebSocket... (attempt %d)\n", attempt);
+
+    if (lws_client_connect_via_info(&i)) {
+        printf("Reconnected to WebSocket!\n");
+    } else {
+        printf("Reconnection failed. Retrying in %d seconds...\n", attempt);
+        sleep(attempt);  // Exponential backoff by increasing the delay after each attempt
+        reconnect_websocket(attempt < 64 ? attempt * 2 : 64);  // Cap the backoff time at 64 seconds
+    }
+}
 
 // Consumer thread for processing trades every minute
 void* consumer(void *arg) {
@@ -367,7 +366,6 @@ void* consumer(void *arg) {
             process_trades(symbols[i], i);
             last_process_time = current_time;
         }
-        //sleep(1);  // You can remove or keep this based on the system's behavior
     }
     return NULL;
 }
